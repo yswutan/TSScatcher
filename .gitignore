@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bam
+*.bai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bw
+*.bedgraph
+results/
+work/
+.DS_Store

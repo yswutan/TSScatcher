@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+bin_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root_dir=$(cd "${bin_dir}/.." && pwd)
+libexec="${root_dir}/libexec"
+source "${libexec}/common.sh"
+source "${root_dir}/config/defaults.env"
+
+usage() {
+cat <<'EOF'
+TSScatcher
+
+Usage:
+  tsscatcher check-fastq [options]
+  tsscatcher mkref [options]
+  tsscatcher map [options]
+  tsscatcher preprocess [options]
+  tsscatcher call-peaks --type <long|short> [options]
+  tsscatcher merge [options]
+  tsscatcher quantify [options]
+  tsscatcher run --samples samples.tsv --reference REF --output DIR [options]
+  tsscatcher run --id ID --fastqs DIR --sample NAME --type <long|short> --reference REF --output DIR [options]
+
+See README.md for complete command examples and parameters.
+EOF
+}
+
+run_project() {
+  local samples= id= fastqs= fastq_sample= type= reference= output=
+  local threads=10 memory=64 deep_learning=yes dl_threshold=$DL_THRESHOLD rescue_distance=$RESCUE_DISTANCE
+  local merge_distance=$MERGE_DISTANCE min_replicates=$MIN_REPLICATES shift_max_distance=$SHIFT_MAX_DISTANCE
+  local extend_bp=$EXTEND_BP peak_count=$PEAK_COUNT peak_summit=$PEAK_SUMMIT confirm_mismatch=no cellranger_bin=cellranger
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --samples) samples=$2; shift 2;; --id) id=$2; shift 2;; --fastqs) fastqs=$2; shift 2;;
+      --sample) fastq_sample=$2; shift 2;; --type) type=$2; shift 2;; --reference) reference=$2; shift 2;;
+      --output) output=$2; shift 2;; --threads) threads=$2; shift 2;; --memory) memory=$2; shift 2;;
+      --deep-learning) deep_learning=$2; shift 2;; --dl-threshold) dl_threshold=$2; shift 2;;
+      --rescue-distance) rescue_distance=$2; shift 2;; --merge-distance) merge_distance=$2; shift 2;;
+      --min-replicates) min_replicates=$2; shift 2;; --shift-max-distance) shift_max_distance=$2; shift 2;;
+      --extend-bp) extend_bp=$2; shift 2;; --peak-count) peak_count=$2; shift 2;; --peak-summit) peak_summit=$2; shift 2;;
+      --confirm-type-mismatch) confirm_mismatch=yes; shift;; --cellranger) cellranger_bin=$2; shift 2;;
+      --help) usage; return 0;; *) die "unknown run option: $1";;
+    esac
+  done
+  [[ -n "$reference" && -n "$output" ]] || die "run requires --reference and --output"
+  reference=$(realpath -m "$reference")
+  output=$(realpath -m "$output")
+  [[ "$deep_learning" == yes || "$deep_learning" == no ]] || die "--deep-learning must be yes or no"
+  for f in "$reference/genome/genome.fa" "$reference/genome/chrom.sizes" "$reference/genome/reference_tss.bed" "$reference/genome/genes.extend${extend_bp}.gtf"; do require_file "$f"; done
+  [[ -d "$reference/cellranger" ]] || die "Cell Ranger reference parent not found: $reference/cellranger"
+  cellranger_ref=$(find "$reference/cellranger" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  [[ -n "$cellranger_ref" ]] || die "no Cell Ranger reference found under $reference/cellranger"
+  [[ -e "$reference/rsem/reference.grp" || -e "$reference/rsem/reference.idx.fa" ]] || die "RSEM reference prefix not found: $reference/rsem/reference"
+  make_dir "$output/results/samples"; make_dir "$output/results/cellranger"; make_dir "$output/results/aggregate"; make_dir "$output/work"
+
+  local runtime="$output/work/samples.tsv"
+  if [[ -n "$samples" ]]; then
+    require_file "$samples"
+    awk 'BEGIN{FS=OFS="\t"} {sub(/\r$/, "", $NF)} NR==1{if($1!="sample_id"||$2!="fastq_dir"||$3!="fastq_sample"||$4!="type")exit 2; print;next} NF{if($4!="long"&&$4!="short")exit 3;print}' "$samples" > "$runtime" || die "sample sheet must begin: sample_id, fastq_dir, fastq_sample, type"
+  else
+    [[ -n "$id" && -n "$fastqs" && -n "$fastq_sample" && ( "$type" == long || "$type" == short ) ]] || die "direct run requires --id, --fastqs, --sample and --type"
+    printf 'sample_id\tfastq_dir\tfastq_sample\ttype\n%s\t%s\t%s\t%s\n' "$id" "$fastqs" "$fastq_sample" "$type" > "$runtime"
+  fi
+  [[ $(tail -n +2 "$runtime" | cut -f1 | sort | uniq -d | wc -l) -eq 0 ]] || die "sample_id values must be unique"
+
+  local merge_manifest="$output/work/merge_manifest.tsv"
+  printf 'sample_id\tpeak_file\n' > "$merge_manifest"
+  while IFS=$'\t' read -r sid fqdir fqsample stype; do
+    [[ "$sid" == sample_id ]] && continue
+    map_args=(--id "$sid" --fastqs "$fqdir" --sample "$fqsample" --type "$stype" --transcriptome "$cellranger_ref" --output "$output/results/cellranger" --threads "$threads" --memory "$memory" --cellranger "$cellranger_bin" --type-check-reads "$TYPE_CHECK_READS" --short-r1-max-length "$SHORT_R1_MAX_LENGTH")
+    [[ "$confirm_mismatch" == yes ]] && map_args+=(--confirm-type-mismatch)
+    "$libexec/map_cellranger.sh" "${map_args[@]}"
+    cr_out="$output/results/cellranger/$sid/outs"
+    sample_out="$output/results/samples/$sid"
+    "$libexec/preprocess.sh" --bam "$cr_out/possorted_genome_bam.bam" --id "$sid" --barcodes "$cr_out/filtered_feature_bc_matrix/barcodes.tsv.gz" --type "$stype" --output "$sample_out/preprocess" --threads "$threads"
+    filtered_bam="$sample_out/preprocess/${sid}.filtered.bam"
+    common=(--bam "$filtered_bam" --id "$sid" --output "$sample_out" --chrom-sizes "$reference/genome/chrom.sizes" --tsolike "$root_dir/ref/TSOlike/TSO_mismatch_2_sort.bed" --fasta "$reference/genome/genome.fa" --reference-tss "$reference/genome/reference_tss.bed" --threads "$threads" --peak-count "$peak_count" --peak-summit "$peak_summit" --deep-learning "$deep_learning" --dl-threshold "$dl_threshold" --rescue-distance "$rescue_distance")
+    if [[ "$stype" == long ]]; then
+      "$libexec/call_long.sh" "${common[@]}"
+    else
+      "$libexec/call_short.sh" "${common[@]}" --rsem-ref "$reference/rsem/reference" --extended-gtf "$reference/genome/genes.extend${extend_bp}.gtf" --extend-bp "$extend_bp" --shift-max-distance "$shift_max_distance"
+    fi
+    if [[ "$deep_learning" == yes ]]; then peak_file="$sample_out/peaks/${sid}.dl_filtered_peaks.bed"; else peak_file="$sample_out/peaks/${sid}.pre_dl_peaks.bed"; fi
+    require_file "$peak_file"; printf '%s\t%s\n' "$sid" "$peak_file" >> "$merge_manifest"
+  done < "$runtime"
+
+  python3 "$libexec/merge_sites.py" --manifest "$merge_manifest" --output-bed "$output/results/aggregate/final_sites.bed.gz" --output-support "$output/results/aggregate/final_sites.support.tsv.gz" --min-replicates "$min_replicates" --merge-distance "$merge_distance"
+  local aggregate_counts="$output/work/aggregate_counts.tsv"; : > "$aggregate_counts"
+  while IFS=$'\t' read -r sid fqdir fqsample stype; do
+    [[ "$sid" == sample_id ]] && continue
+    sample_out="$output/results/samples/$sid"; counts="$output/work/${sid}.counts.tsv"
+    "$libexec/quantify.sh" --id "$sid" --reads "$sample_out/reads/${sid}.reads.bed.gz" --final-sites "$output/results/aggregate/final_sites.bed.gz" --output "$sample_out/matrix" --counts-output "$counts"
+    awk -v s="$sid" 'BEGIN{FS=OFS="\t"}{print $1,s"#"$2,$3}' "$counts" >> "$aggregate_counts"
+  done < "$runtime"
+  sort -k1,1 -k2,2 "$aggregate_counts" -o "$aggregate_counts"
+  python3 "$libexec/matrix_from_counts.py" --final-sites "$output/results/aggregate/final_sites.bed.gz" --counts "$aggregate_counts" --output "$output/results/aggregate/matrix"
+  note "TSScatcher run completed: $output/results"
+}
+
+[[ $# -gt 0 ]] || { usage; exit 0; }
+command=$1; shift
+case "$command" in
+  help|-h|--help) usage;;
+  check-fastq) exec python3 "$libexec/check_fastq.py" "$@";;
+  mkref) exec "$libexec/prepare_reference.sh" "$@";;
+  map) exec "$libexec/map_cellranger.sh" "$@";;
+  preprocess) exec "$libexec/preprocess.sh" "$@";;
+  call-peaks)
+    call_type=
+    args=()
+    while [[ $# -gt 0 ]]; do if [[ "$1" == --type ]]; then call_type=$2; shift 2; else args+=("$1"); shift; fi; done
+    [[ "$call_type" == long || "$call_type" == short ]] || die "call-peaks requires --type long or --type short"
+    exec "$libexec/call_${call_type}.sh" "${args[@]}";;
+  merge) exec python3 "$libexec/merge_sites.py" "$@";;
+  quantify) exec "$libexec/quantify.sh" "$@";;
+  run) run_project "$@";;
+  *) die "unknown command: $command";;
+esac

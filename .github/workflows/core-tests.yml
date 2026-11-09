@@ -1,0 +1,17 @@
+name: core-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          bash -n bin/tsscatcher
+          for script in libexec/*.sh; do bash -n "$script"; done
+      - name: Run core tests
+        run: bash tests/test_core.sh

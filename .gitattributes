@@ -1,0 +1,13 @@
+* text=auto
+*.sh text eol=lf
+bin/tsscatcher text eol=lf
+*.py text eol=lf
+*.pl text eol=lf
+*.R text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.tsv text eol=lf
+*.env text eol=lf
+*.bed text eol=lf
+*.pth binary

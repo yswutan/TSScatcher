@@ -1,0 +1,28 @@
+name: tsscatcher
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.9
+  - r-base
+  - r-ggplot2
+  - bioconductor-rtracklayer
+  - samtools
+  - bedtools
+  - bedops
+  - star
+  - rsem
+  - paraclu
+  - ucsc-bedgraphtobigwig
+  - parallel
+  - perl
+  - pandas>=2.0.3
+  - pysam>=0.22.0
+  - tqdm>=4.67.1
+  - pytorch>=2.2.1
+  - editdistance
+  - pip
+  - pip:
+      - gppy
+
+# Cell Ranger is licensed separately and must be installed by the user.

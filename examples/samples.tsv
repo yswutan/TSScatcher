@@ -1,0 +1,3 @@
+sample_id	fastq_dir	fastq_sample	type
+sample01	/path/to/fastqs	sample01	long
+sample02	/path/to/fastqs	sample02	short
